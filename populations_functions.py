@@ -12,8 +12,8 @@ g_ghost = np.arange(g_min-dg,g_max+2*dg,dg)
 g = np.array(g_ghost[1:-1])
 
 #Time:
-dt = 0.00016
-T = 20
+dt = 0.00008
+T = 30
 Nt = int(T/dt)
 TimeRange = np.arange(0,T,dt)
 
@@ -166,3 +166,95 @@ def discrete_entropy(p_dist):
 def cont_entropy(p_dist):
     p_dist = p_dist[np.where(np.clip(p_dist,eps,None)>eps)]
     return np.trapz(p_dist*np.log2(1/p_dist),dx=dg)
+
+@jit(nopython=True)
+def selection_dyn(p0_unreg,p0_reg,sug_dyn,alpha,delta):
+    #First, define the fitness function:
+#     fit = delta*((.17/g_max)*(g*s/(400+s) - (2/17)*g/(1-g/(1.8*g_max))) + 0)
+    s = sug_dyn[0]
+    fit = delta*(g*s/(400+s) - (2/17)*g/(1-g/(1.8*g_max)))
+    g_reg = g[np.argmax(fit)]
+
+    #Now let's compare the effects of regulation vs selection:
+    p_unreg = p0_unreg
+    p_reg = p0_reg
+    flag_unreg = 0
+    flag_reg = 0
+    
+    #Storing dynamic fitness:
+    dyn_fit_unreg, dyn_norm_fit_unreg, dyn_fit_reg, dyn_norm_fit_reg = np.zeros_like(TimeRange), np.zeros_like(TimeRange), np.zeros_like(TimeRange), np.zeros_like(TimeRange)
+    #Dynamic distributions:
+    dyn_p_unreg, dyn_p_reg = np.zeros((len(TimeRange),len(g))), np.zeros((len(TimeRange),len(g)))
+    dyn_p_unreg[0,:], dyn_p_reg[0,:] = p_unreg, p_reg    
+
+    #Now evolve it:
+    for t in range(len(TimeRange)):
+        #First setting the dynamic sugar and g_reg:
+        s = sug_dyn[t]
+        fit = delta*(g*s/(400+s) - (2/17)*g/(1-g/(1.8*g_max)))
+        g_reg = g[np.argmax(fit)]
+        
+        #Setting the diffusion constants, unregulated first:
+        g_mean_unreg = np.trapz(g*p_unreg,g)
+        if (alpha*g_mean_unreg<=1):
+            flag_unreg = 1
+            D_unreg = 1.1
+        elif (alpha*K*g_mean_unreg>=int(0.5*dg**2/dt)):
+            flag_unreg = 1
+            D_unreg = 0.9*(0.5*dg**2/dt)
+        else:
+            D_unreg = alpha*K*g_mean_unreg
+
+        #Regulated:
+        g_mean_reg = np.trapz(g*p_reg,g)
+        if (alpha*g_mean_reg<=1):
+            flag_reg = 1
+            D_reg = 1.1
+        elif (alpha*K*g_mean_reg>=int(0.5*dg**2/dt)):
+            flag_reg = 1
+            D_reg = 0.9*(0.5*dg**2/dt)
+        else:
+            D_reg = alpha*K*g_mean_reg
+
+    #     #Checks:
+    #     if (t%10==0):
+    #         print(f"\nt={t}; g_mean_unreg={round(g_mean_unreg,2)}; D_unreg={round(D_unreg,2)}; max allowed={0.5*dg**2/dt}")
+    #         print(f"t={t}; g_mean_reg={round(g_mean_reg,2)}; D_reg={round(D_reg,2)}; max allowed={0.5*dg**2/dt}")        
+
+        #Now creating the expanded p's, with ghost points. The bulk points are the same in each. Unregulated:
+        p_unreg_ghost = np.zeros(len(p_unreg)+2)
+        p_unreg_ghost[1:-1] = p_unreg
+        #Regulated:
+        p_reg_ghost = np.zeros(len(p_reg)+2)
+        p_reg_ghost[1:-1] = p_reg
+
+        #Setting the value of the ghost points. This represents the zero flux boundary conditions. Unregulated:
+        p_unreg_ghost[0] = p_unreg[1] + 2*dg*(K/D_unreg)*(g[0]-g_peak)*p_unreg[0]
+        p_unreg_ghost[-1] = p_unreg[-2] + 2*dg*(K/D_unreg)*(g_peak-g[-1])*p_unreg[-1]
+        #Regulated:
+        p_reg_ghost[0] = p_reg[1] + 2*dg*(K/D_reg)*(g[0]-g_reg)*p_reg[0]
+        p_reg_ghost[-1] = p_reg[-2] + 2*dg*(K/D_reg)*(g_reg-g[-1])*p_reg[-1]    
+
+        #Now to solve the equation. Unregulated first:
+        p_unreg = p_unreg + dt*((fit - mean_wrt_P(fit,p_unreg,g))*p_unreg \
+                    + K*derv1((g_ghost-g_peak)*p_unreg_ghost,dg) + D_unreg*derv2(p_unreg_ghost,dg))
+        p_reg = p_reg + dt*((fit - mean_wrt_P(fit,p_reg,g))*p_reg \
+                    + K*derv1((g_ghost-g_reg)*p_reg_ghost,dg) + D_reg*derv2(p_reg_ghost,dg))
+
+        #Finally, for the edge cases, we normalize:
+        if (flag_unreg==1 or delta>=1): #Because apparently this blows up temporarily when delta>1
+            p_unreg = p_unreg/np.trapz(p_unreg,dx=dg)
+        if (flag_reg==1 or delta>=1):
+            p_reg = p_reg/np.trapz(p_reg,dx=dg)
+            
+        #Storing the dynamic distributions:
+        dyn_p_unreg[t,:], dyn_p_reg[t,:] = p_unreg, p_reg
+            
+        #Now calculating the dynamic fitnesses, absolute:
+        dyn_fit_unreg[t] = mean_wrt_P(fit,p_unreg,g)
+        dyn_fit_reg[t] = mean_wrt_P(fit,p_reg,g)
+        #Normalized:
+        dyn_norm_fit_unreg[t] = (dyn_fit_unreg[t] - np.min(fit))/(np.max(fit) - np.min(fit))
+        dyn_norm_fit_reg[t] = (dyn_fit_reg[t] - np.min(fit))/(np.max(fit) - np.min(fit))
+            
+    return dyn_p_unreg, dyn_p_reg, dyn_fit_unreg, dyn_norm_fit_unreg, dyn_fit_reg, dyn_norm_fit_reg
